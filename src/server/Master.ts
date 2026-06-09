@@ -3,6 +3,7 @@ import crypto from "crypto";
 import express from "express";
 import rateLimit from "express-rate-limit";
 import http from "http";
+import net from "net";
 import path from "path";
 import { fileURLToPath } from "url";
 import { GameEnv } from "../core/configuration/Config";
@@ -135,7 +136,49 @@ export async function startMaster() {
     );
   });
 
-  const PORT = 3000;
+  // Proxy /w{n}/... to game worker processes when running without nginx
+  if (process.env.PORT) {
+    server.on("upgrade", (req, socket, head) => {
+      const match = req.url?.match(/^\/w(\d+)(\/[^?]*)?(\?.*)?$/);
+      if (!match) return;
+      const workerPort = ServerEnv.workerPortByIndex(parseInt(match[1]));
+      const workerPath = (match[2] ?? "/") + (match[3] ?? "");
+      const upstream = net.connect(workerPort, "127.0.0.1", () => {
+        upstream.write(
+          `GET ${workerPath} HTTP/1.1\r\n` +
+            Object.entries(req.headers)
+              .map(([k, v]) => `${k}: ${v}`)
+              .join("\r\n") +
+            "\r\n\r\n",
+        );
+        if (head?.length) upstream.write(head);
+        socket.pipe(upstream);
+        upstream.pipe(socket);
+      });
+      upstream.on("error", () => socket.destroy());
+      socket.on("error", () => upstream.destroy());
+    });
+
+    app.use(/^\/w(\d+)(\/.*)?$/, (req, res) => {
+      const workerPort = ServerEnv.workerPortByIndex(
+        parseInt((req.params as Record<string, string>)[0]),
+      );
+      const workerPath =
+        ((req.params as Record<string, string>)[1] ?? "/") +
+        (req.url.includes("?") ? req.url.slice(req.url.indexOf("?")) : "");
+      const proxy = http.request(
+        { hostname: "127.0.0.1", port: workerPort, path: workerPath, method: req.method, headers: req.headers },
+        (upstream) => {
+          res.writeHead(upstream.statusCode ?? 502, upstream.headers);
+          upstream.pipe(res);
+        },
+      );
+      proxy.on("error", () => res.status(502).end());
+      req.pipe(proxy);
+    });
+  }
+
+  const PORT = parseInt(process.env.PORT ?? "3000", 10);
   server.listen(PORT, () => {
     log.info(`Master HTTP server listening on port ${PORT}`);
   });
